@@ -14,6 +14,15 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
+    // Parse the request body to get company_id
+    const { company_id } = await req.json();
+
+    if (!company_id) {
+      throw new Error("company_id is required");
+    }
+
+    console.log(`Creating onepager for company: ${company_id}`);
+
     // Load the Mistral API key from environment variables
     const mistralApiKey = Deno.env.get("MISTRAL_API_KEY");
     if (!mistralApiKey) {
@@ -22,7 +31,7 @@ Deno.serve(async (req: Request) => {
 
     console.log("MISTRAL_API_KEY loaded successfully");
 
-    // Create the onepager content
+    // Create the onepager content (will use company_id in the future)
     const content = "hello world";
 
     // Simulate processing time (e.g. calling Mistral API)
