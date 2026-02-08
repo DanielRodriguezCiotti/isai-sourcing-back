@@ -24,7 +24,7 @@ jobs:
           version: latest
 
       - name: Deploy create-onepager function
-        run: supabase functions deploy create-onepager --project-ref $PROJECT_ID
+        run: supabase functions deploy create-onepager --no-verify-jwt --project-ref $PROJECT_ID
 
       - name: Deploy push-to-attio function
-        run: supabase functions deploy push-to-attio --project-ref $PROJECT_ID
+        run: supabase functions deploy push-to-attio --no-verify-jwt --project-ref $PROJECT_ID
