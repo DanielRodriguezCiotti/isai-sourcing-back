@@ -59,7 +59,7 @@ Deno.serve(async (req: Request) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const bucketName = Deno.env.get("TRAXCN_EXPORTS_BUCKET_NAME");
+    const bucketName = "traxcn_exports";
 
     if (!bucketName) {
       throw new Error("TRAXCN_EXPORTS_BUCKET_NAME is not set");
