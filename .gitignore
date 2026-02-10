@@ -13,3 +13,9 @@ Thumbs.db
 
 # Supabase local
 supabase/.temp/
+
+# Claude code
+.mcp.json
+.claude
+CLAUDE.md
+*.csv
