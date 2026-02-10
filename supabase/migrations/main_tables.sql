@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS public.funding_rounds (
   lead_investors TEXT[],
   all_investors TEXT[],
   source TEXT -- "cb" or "tracxn"
+  CONSTRAINT uq_funding_rounds_identity UNIQUE (date, company_id, stage, source)
 );
 
 -- funding_rounds column descriptions
@@ -154,6 +155,7 @@ CREATE TABLE IF NOT EXISTS public.founders (
   description TEXT, 
   linkedin_url TEXT,
   source TEXT -- "crunchbase" or "tracxn"
+  CONSTRAINT uq_founders_identity UNIQUE (name, role, company_id)
 );
 
 -- founders column descriptions
