@@ -28,3 +28,6 @@ jobs:
 
       - name: Deploy push-to-attio function
         run: supabase functions deploy push-to-attio --no-verify-jwt --project-ref $PROJECT_ID
+
+      - name: Deploy assess-db-changes-from-traxcn-export function
+        run: supabase functions deploy assess-db-changes-from-traxcn-export --no-verify-jwt --project-ref $PROJECT_ID
