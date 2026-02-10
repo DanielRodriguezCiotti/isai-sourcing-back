@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS public.companies (
   -- Basic company information
   logo TEXT,
   name TEXT NOT NULL,
-  domains TEXT[],
+  domain TEXT NOT NULL UNIQUE,
   hq_country TEXT,
   hq_city TEXT,
   inc_date INTEGER, -- Year only (YYYY)
@@ -24,10 +24,25 @@ CREATE TABLE IF NOT EXISTS public.companies (
   last_funding_date TEXT, -- MM/YYYY format
   all_investors TEXT, -- max 50 words enforced at application level
   headcount INTEGER
+
+  -- Source of the company data
+  source TEXT -- "crunchbase" or "tracxn" or "both"
+
+  -- Potential manual fields that can be filled by the user
+  solution_fit_cg_manual INTEGER,
+  solution_fit_by_manual INTEGER,
+  business_fit_cg_manual INTEGER,
+  business_fit_by_manual INTEGER,
+  maturity_fit_manual INTEGER,
+  equity_score_manual INTEGER,
+  traction_score_manual INTEGER,
+  global_fund_score_manual INTEGER,
 );
 
+
+
 COMMENT ON TABLE public.companies IS
-  'Core company table aggregating data from Crunchbase and Tracxn. Each row represents a unique company tracked by ISAI.';
+  'Core company table aggregating data from Crunchbase and Tracxn. Each row represents a unique company tracked by ISAI. We do reconciliation based on the domain. Sometimes, we have both sources and sometimes only one.';
 
 COMMENT ON COLUMN public.companies.id IS
   'Unique identifier for the company record. Auto-generated UUID.';
@@ -44,8 +59,8 @@ COMMENT ON COLUMN public.companies.logo IS
 COMMENT ON COLUMN public.companies.name IS
   'Official company name. Sources: CB (organizations.csv → name), Tracxn (Companies Covered 1.1 → Company Name). Priority: Tracxn.';
 
-COMMENT ON COLUMN public.companies.domains IS
-  'List of company domain names (supports multiple domains). Sources: CB (organizations.csv → domain), Tracxn (Companies Covered 1.1 → Domain Name). Priority: Tracxn.';
+COMMENT ON COLUMN public.companies.domain IS
+  'Main company domain name. Sources: CB (organizations.csv → domain), Tracxn (Companies Covered 1.1 → Domain Name). Priority: Tracxn.';
 
 COMMENT ON COLUMN public.companies.hq_country IS
   'Country where the company headquarters is located. Sources: CB (organizations.csv → country_code), Tracxn (Companies Covered 1.1 → Country). Priority: Tracxn.';
@@ -90,13 +105,14 @@ CREATE TABLE IF NOT EXISTS public.funding_rounds (
   date DATE,
   stage TEXT, -- e.g. Seed, Series A, Series B…
   amount NUMERIC, -- Amount in millions
-  lead_investor TEXT,
-  all_investors TEXT
+  lead_investors TEXT[],
+  all_investors TEXT[],
+  source TEXT -- "cb" or "tracxn"
 );
 
 -- funding_rounds column descriptions
 COMMENT ON TABLE public.funding_rounds IS
-  'Individual funding rounds for each company. Sources: CB (funding_rounds.csv), Tracxn (Funding Rounds 2.1). One row per round per company.';
+  'Individual funding rounds for each company. Sources: CB (funding_rounds.csv), Tracxn (Funding Rounds 2.1). One row per round per company. For this table, there is no reconciliation, we store all data from both sources.';
 
 COMMENT ON COLUMN public.funding_rounds.id IS
   'Unique identifier for the funding round record. Auto-generated UUID.';
@@ -119,11 +135,14 @@ COMMENT ON COLUMN public.funding_rounds.stage IS
 COMMENT ON COLUMN public.funding_rounds.amount IS
   'Amount raised in this funding round, in millions USD. Sources: CB (funding_rounds.csv → raised_amount_usd), Tracxn (Funding Rounds 2.1 → Round Amount (USD)).';
 
-COMMENT ON COLUMN public.funding_rounds.lead_investor IS
+COMMENT ON COLUMN public.funding_rounds.lead_investors IS
   'Lead investor(s) for this funding round. Sources: CB (investors.csv → matched from lead_investor_uuids), Tracxn (Funding Rounds 2.1 → Lead Investor).';
 
 COMMENT ON COLUMN public.funding_rounds.all_investors IS
   'All investors participating in this funding round. Sources: CB (funding_rounds.csv → investor_uuids matched to investor names), Tracxn (Funding Rounds 2.1 → Investors).';
+
+COMMENT ON COLUMN public.funding_rounds.source IS
+  'Source of the funding round data. "crunchbase" for Crunchbase, "tracxn" for Tracxn.';
 
 -- Create the founders table
 CREATE TABLE IF NOT EXISTS public.founders (
@@ -134,12 +153,14 @@ CREATE TABLE IF NOT EXISTS public.founders (
   company_id UUID NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   role TEXT, -- e.g. Founder, Co-founder, CEO & Founder
-  linkedin_url TEXT
+  description TEXT, 
+  linkedin_url TEXT,
+  source TEXT -- "crunchbase" or "tracxn"
 );
 
 -- founders column descriptions
 COMMENT ON TABLE public.founders IS
-  'Founders and co-founders linked to each company. Sources: CB (people.csv + people_descriptions.csv filtered by Founder/Co-founder roles), Tracxn (Companies Covered 1.1 → Key People Info + Team Background). Priority: CB.';
+  'Founders and co-founders linked to each company. Sources: CB (people.csv + people_descriptions.csv), Tracxn (People 2.1). Priority to Crunchbase. It means that if we have the company in crunchbase, we fill the whole table with crunchbase, otherwise we fill the table with tracxn. But no mixing of sources per company to avoid having 2 times the same founder';
 
 COMMENT ON COLUMN public.founders.id IS
   'Unique identifier for the founder record. Auto-generated UUID.';
@@ -159,53 +180,15 @@ COMMENT ON COLUMN public.founders.name IS
 COMMENT ON COLUMN public.founders.role IS
   'Role/title of the founder within the company (e.g. Founder, Co-founder, CEO & Founder). Sources: CB (people.csv → featured_job_title), Tracxn (Companies Covered 1.1 → Key People Info).';
 
+COMMENT ON COLUMN public.founders.description IS
+  'Description of the founder. Sources: CB (people_descriptions.csv → description), Tracxn (People 2.1 → description).';
+
 COMMENT ON COLUMN public.founders.linkedin_url IS
-  'LinkedIn profile URL of the founder. Source: CB (people.csv → linkedin_url).';
+  'LinkedIn profile URL of the founder. Source: CB (people.csv → linkedin_url), Tracxn (People 2.1 → profile_links).';
 
--- Create the linkedin_enrichment table
-CREATE TABLE IF NOT EXISTS public.linkedin_enrichment (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now(),
+COMMENT ON COLUMN public.founders.source IS
+  'Source of the founder data. "crunchbase" for Crunchbase, "tracxn" for Tracxn.';
 
-  founder_id UUID NOT NULL REFERENCES public.founders(id) ON DELETE CASCADE,
-  storage_path TEXT, -- Path in Supabase Storage containing the raw scraped LinkedIn profile
-  sourcing_date DATE, -- Date when the LinkedIn profile was retrieved
-  background_summary TEXT, -- Professional background extracted from LinkedIn
-  education_summary TEXT, -- Education details extracted from LinkedIn
-  serial_entrepreneur BOOLEAN -- NULL means not yet determined
-);
-
--- linkedin_enrichment column descriptions
-COMMENT ON TABLE public.linkedin_enrichment IS
-  'LinkedIn profile enrichment data for founders. Contains scraped and summarized information from LinkedIn profiles, linked to the raw stored profile in Supabase Storage.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.id IS
-  'Unique identifier for the enrichment record. Auto-generated UUID.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.created_at IS
-  'Timestamp when the enrichment record was first created in the database.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.updated_at IS
-  'Timestamp of the last modification to the enrichment record. Automatically updated via trigger.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.founder_id IS
-  'Foreign key referencing the founder this enrichment belongs to. Cascades on delete.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.storage_path IS
-  'Path in Supabase Storage pointing to the raw scraped LinkedIn profile (HTML/JSON). Used to reprocess or audit enrichment data.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.sourcing_date IS
-  'Date when the LinkedIn profile information was retrieved/scraped. Useful to track data freshness.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.background_summary IS
-  'Professional and biographical background of the founder, summarized from the LinkedIn profile. Sources: CB (people_descriptions.csv → description), Tracxn (Companies Covered 1.1 → Team Background), LinkedIn scrape.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.education_summary IS
-  'Educational background of the founder (degrees, institutions), summarized from the LinkedIn profile. Sources: CB (people_descriptions.csv), Tracxn (Companies Covered 1.1 → Key People Info), LinkedIn scrape.';
-
-COMMENT ON COLUMN public.linkedin_enrichment.serial_entrepreneur IS
-  'Whether the founder has previously founded other companies, determined from LinkedIn experience. NULL means the information has not been determined yet.';
 
 -- Create the dealroom_enrichment table
 CREATE TABLE IF NOT EXISTS public.dealroom_enrichment (
@@ -269,9 +252,9 @@ CREATE TABLE IF NOT EXISTS public.web_scraping_enrichment (
   detailed_solution TEXT,
   key_features TEXT,
   use_cases TEXT,
-  industries_served TEXT,
-  key_clients TEXT,
-  key_partners TEXT,
+  industries_served_description TEXT,
+  key_clients TEXT[],
+  key_partners TEXT[],
   nb_of_clients_identified TEXT
 );
 
@@ -309,7 +292,7 @@ COMMENT ON COLUMN public.web_scraping_enrichment.key_features IS
 COMMENT ON COLUMN public.web_scraping_enrichment.use_cases IS
   'Target use cases or problem scenarios the company addresses, extracted from the website.';
 
-COMMENT ON COLUMN public.web_scraping_enrichment.industries_served IS
+COMMENT ON COLUMN public.web_scraping_enrichment.industries_served_description IS
   'Industries or verticals the company targets, extracted from the website.';
 
 COMMENT ON COLUMN public.web_scraping_enrichment.key_clients IS
@@ -321,42 +304,42 @@ COMMENT ON COLUMN public.web_scraping_enrichment.key_partners IS
 COMMENT ON COLUMN public.web_scraping_enrichment.nb_of_clients_identified IS
   'Number of clients identified or claimed on the website (stored as text to accommodate ranges or qualifiers like "100+").';
 
--- Create the rocket_reach_enrichment table
-CREATE TABLE IF NOT EXISTS public.rocket_reach_enrichment (
+-- Create the hunter_enrichment table
+CREATE TABLE IF NOT EXISTS public.hunter_enrichment (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now(),
 
   founder_id UUID NOT NULL REFERENCES public.founders(id) ON DELETE CASCADE,
-  storage_path TEXT, -- Path in Supabase Storage containing the raw RocketReach data
-  sourcing_date DATE, -- Date when the RocketReach data was retrieved
+  storage_path TEXT, -- Path in Supabase Storage containing the raw Hunter data
+  sourcing_date DATE, -- Date when the Hunter data was retrieved
   email TEXT
 );
 
--- rocket_reach_enrichment column descriptions
-COMMENT ON TABLE public.rocket_reach_enrichment IS
-  'RocketReach enrichment data for founders. Contains contact information retrieved from RocketReach, linked to the raw stored response in Supabase Storage.';
+-- hunter_enrichment column descriptions
+COMMENT ON TABLE public.hunter_enrichment IS
+  'Hunter enrichment data for founders. Contains contact information retrieved from Hunter, linked to the raw stored response in Supabase Storage.';
 
-COMMENT ON COLUMN public.rocket_reach_enrichment.id IS
+COMMENT ON COLUMN public.hunter_enrichment.id IS
   'Unique identifier for the enrichment record. Auto-generated UUID.';
 
-COMMENT ON COLUMN public.rocket_reach_enrichment.created_at IS
+COMMENT ON COLUMN public.hunter_enrichment.created_at IS
   'Timestamp when the enrichment record was first created in the database.';
 
-COMMENT ON COLUMN public.rocket_reach_enrichment.updated_at IS
+COMMENT ON COLUMN public.hunter_enrichment.updated_at IS
   'Timestamp of the last modification to the enrichment record. Automatically updated via trigger.';
 
-COMMENT ON COLUMN public.rocket_reach_enrichment.founder_id IS
+COMMENT ON COLUMN public.hunter_enrichment.founder_id IS
   'Foreign key referencing the founder this enrichment belongs to. Cascades on delete.';
 
-COMMENT ON COLUMN public.rocket_reach_enrichment.storage_path IS
-  'Path in Supabase Storage pointing to the raw RocketReach response. Used to reprocess or audit enrichment data.';
+COMMENT ON COLUMN public.hunter_enrichment.storage_path IS
+  'Path in Supabase Storage pointing to the raw Hunter response. Used to reprocess or audit enrichment data.';
 
-COMMENT ON COLUMN public.rocket_reach_enrichment.sourcing_date IS
-  'Date when the RocketReach data was retrieved. Useful to track data freshness.';
+COMMENT ON COLUMN public.hunter_enrichment.sourcing_date IS
+  'Date when the Hunter data was retrieved. Useful to track data freshness.';
 
-COMMENT ON COLUMN public.rocket_reach_enrichment.email IS
-  'Professional email address of the founder, retrieved from RocketReach.';
+COMMENT ON COLUMN public.hunter_enrichment.email IS
+  'Professional email address of the founder, retrieved from Hunter.';
 
 -- Create the business_computed_values table
 CREATE TABLE IF NOT EXISTS public.business_computed_values (
@@ -368,25 +351,27 @@ CREATE TABLE IF NOT EXISTS public.business_computed_values (
   calculus_date TIMESTAMPTZ NOT NULL DEFAULT now(), -- When the full calculation pipeline was last run
 
   -- Client/partner matching against reference lists
-  global_2000_clients TEXT[], -- Global 2000 companies identified as clients of this company
-  competitors_cap TEXT[], -- Capgemini competitors that are partners or clients of this company
-  competitors_by TEXT[], -- Bouygues competitors that are partners or clients of this company
+  global_2000_clients TEXT[], -- Global 2000 companies identified as clients of this company using fuzzy matching
+  competitors_cg TEXT[], -- Capgemini competitors that are partners or clients of this company using fuzzy matching
+  competitors_by TEXT[], -- Bouygues competitors that are partners or clients of this company using fuzzy matching
 
   -- Go-to-market targets (per fund)
-  gtm_target_cap TEXT, -- GTM target classification for Capgemini fund
-  gtm_target_by TEXT, -- GTM target classification for Bouygues fund
+  gtm_target TEXT, -- GTM target classification for Capgemini fund using generic GTM taxonomy
+  gtm_target_by TEXT, -- GTM target classification for Bouygues fund using specific BY GTM taxonomy
 
   -- Funding round computed fields (derived from funding_rounds table)
-  first_vc_round_date DATE, -- Earliest institutional VC round date
-  first_vc_round_amount NUMERIC, -- Amount of the first institutional VC round, in millions USD
-  last_round_lead_investors TEXT, -- Lead investor(s) of the most recent round
+  first_vc_round_date DATE, -- Earliest institutional VC round date cross CB and Tracxn
+  first_vc_round_amount NUMERIC, -- Amount of the first institutional VC round, in millions USD cross CB and Tracxn
+  last_round_lead_investors TEXT, -- Lead investor(s) of the most recent round cross CB and Tracxn
+  total_number_of_funding_rounds INTEGER, -- Total number of funding rounds, max of (sum of CB vs sum of Tracxn)
 
   -- Business classification
-  business_model TEXT,
+  business_model TEXT, -- Business model classification for the company using business model taxonomy
 
-  -- Sector/industry classification (per fund)
-  primary_sector_served_cap TEXT, -- Primary sector for Capgemini taxonomy
-  primary_industry_served_cap TEXT, -- Primary industry for Capgemini taxonomy
+  -- Sector/industry classification (per fund) - we identify the industries served from the taxonomy in order of relevance
+  scope TEXT, -- "cg" for Capgemini, "by" for Bouygues, "both" for both, it depends only on the sectors and industry served
+  primary_sector_served_cg TEXT, -- Primary sector for Capgemini taxonomy
+  primary_industry_served_cg TEXT, -- Primary industry for Capgemini taxonomy
   primary_sector_served_by TEXT, -- Primary sector for Bouygues taxonomy
   primary_industry_served_by TEXT, -- Primary industry for Bouygues taxonomy
   all_industries_served TEXT[], -- All industries the company serves
@@ -398,9 +383,9 @@ CREATE TABLE IF NOT EXISTS public.business_computed_values (
   all_tech_tags TEXT[], -- Union of static + dynamic tech tags
 
   -- Fit scores (per fund where applicable)
-  solution_fit_cap INTEGER, -- Solution fit score for Capgemini
+  solution_fit_cg INTEGER, -- Solution fit score for Capgemini
   solution_fit_by INTEGER, -- Solution fit score for Bouygues
-  business_fit_cap INTEGER, -- Business fit score for Capgemini
+  business_fit_cg INTEGER, -- Business fit score for Capgemini
   business_fit_by INTEGER, -- Business fit score for Bouygues
   maturity_fit INTEGER, -- Maturity fit score (fund-agnostic)
   equity_score INTEGER, -- Equity/investment attractiveness score
@@ -435,13 +420,13 @@ COMMENT ON COLUMN public.business_computed_values.calculus_date IS
 COMMENT ON COLUMN public.business_computed_values.global_2000_clients IS
   'List of Forbes Global 2000 companies identified as clients of this company. Matched against the global_2000 reference table.';
 
-COMMENT ON COLUMN public.business_computed_values.competitors_cap IS
+COMMENT ON COLUMN public.business_computed_values.competitors_cg IS
   'List of Capgemini competitors that are partners or clients of this company. Matched against the cap_competitors reference table.';
 
 COMMENT ON COLUMN public.business_computed_values.competitors_by IS
   'List of Bouygues competitors that are partners or clients of this company. Matched against the by_competitors reference table.';
 
-COMMENT ON COLUMN public.business_computed_values.gtm_target_cap IS
+COMMENT ON COLUMN public.business_computed_values.gtm_target IS
   'Go-to-market target classification for the Capgemini fund perspective. Matched against the gtm_target reference table.';
 
 COMMENT ON COLUMN public.business_computed_values.gtm_target_by IS
@@ -456,13 +441,19 @@ COMMENT ON COLUMN public.business_computed_values.first_vc_round_amount IS
 COMMENT ON COLUMN public.business_computed_values.last_round_lead_investors IS
   'Lead investor(s) of the most recent funding round, computed from the funding_rounds table.';
 
+COMMENT ON COLUMN public.business_computed_values.total_number_of_funding_rounds IS
+  'Total number of funding rounds, computed as the max of the sum from CB vs the sum from Tracxn.';
+
 COMMENT ON COLUMN public.business_computed_values.business_model IS
   'Business model classification for the company. Matched against the business_models reference table.';
 
-COMMENT ON COLUMN public.business_computed_values.primary_sector_served_cap IS
+COMMENT ON COLUMN public.business_computed_values.scope IS
+  'Fund scope for this company. "cg" for Capgemini only, "by" for Bouygues only, "both" for both funds. Determined solely by the sectors and industries served.';
+
+COMMENT ON COLUMN public.business_computed_values.primary_sector_served_cg IS
   'Primary sector the company serves, classified using the Capgemini taxonomy (cap_sectors_and_industries).';
 
-COMMENT ON COLUMN public.business_computed_values.primary_industry_served_cap IS
+COMMENT ON COLUMN public.business_computed_values.primary_industry_served_cg IS
   'Primary industry the company serves, classified using the Capgemini taxonomy (cap_sectors_and_industries).';
 
 COMMENT ON COLUMN public.business_computed_values.primary_sector_served_by IS
@@ -486,13 +477,13 @@ COMMENT ON COLUMN public.business_computed_values.tech_tags_dynamic IS
 COMMENT ON COLUMN public.business_computed_values.all_tech_tags IS
   'Union of static (tech_tags) and dynamic (tech_tags_dynamic) technology tags.';
 
-COMMENT ON COLUMN public.business_computed_values.solution_fit_cap IS
+COMMENT ON COLUMN public.business_computed_values.solution_fit_cg IS
   'Solution fit score for the Capgemini fund. Integer score evaluating how well the company solution fits Capgemini needs.';
 
 COMMENT ON COLUMN public.business_computed_values.solution_fit_by IS
   'Solution fit score for the Bouygues fund. Integer score evaluating how well the company solution fits Bouygues needs.';
 
-COMMENT ON COLUMN public.business_computed_values.business_fit_cap IS
+COMMENT ON COLUMN public.business_computed_values.business_fit_cg IS
   'Business fit score for the Capgemini fund. Integer score evaluating business compatibility with Capgemini.';
 
 COMMENT ON COLUMN public.business_computed_values.business_fit_by IS
@@ -546,10 +537,10 @@ CREATE TRIGGER update_founders_updated_at
   FOR EACH ROW
   EXECUTE FUNCTION public.update_updated_at_column();
 
--- Create trigger for rocket_reach_enrichment updated_at
-DROP TRIGGER IF EXISTS update_rocket_reach_enrichment_updated_at ON public.rocket_reach_enrichment;
-CREATE TRIGGER update_rocket_reach_enrichment_updated_at
-  BEFORE UPDATE ON public.rocket_reach_enrichment
+-- Create trigger for hunter_enrichment updated_at
+DROP TRIGGER IF EXISTS update_hunter_enrichment_updated_at ON public.hunter_enrichment;
+CREATE TRIGGER update_hunter_enrichment_updated_at
+  BEFORE UPDATE ON public.hunter_enrichment
   FOR EACH ROW
   EXECUTE FUNCTION public.update_updated_at_column();
 
@@ -591,7 +582,7 @@ CREATE TRIGGER update_business_computed_values_updated_at
 -- Enable Row Level Security
 ALTER TABLE public.companies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.founders ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.rocket_reach_enrichment ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.hunter_enrichment ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.web_scraping_enrichment ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.dealroom_enrichment ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.linkedin_enrichment ENABLE ROW LEVEL SECURITY;
@@ -612,7 +603,7 @@ CREATE POLICY "Authenticated users have full access"
   WITH CHECK (true);
 
 CREATE POLICY "Authenticated users have full access"
-  ON public.rocket_reach_enrichment FOR ALL
+  ON public.hunter_enrichment FOR ALL
   TO authenticated
   USING (true)
   WITH CHECK (true);
@@ -657,7 +648,7 @@ CREATE INDEX IF NOT EXISTS idx_companies_inc_date ON public.companies(inc_date);
 CREATE INDEX IF NOT EXISTS idx_companies_created_at ON public.companies(created_at);
 CREATE INDEX IF NOT EXISTS idx_founders_company_id ON public.founders(company_id);
 CREATE INDEX IF NOT EXISTS idx_founders_name ON public.founders(name);
-CREATE INDEX IF NOT EXISTS idx_rocket_reach_enrichment_founder_id ON public.rocket_reach_enrichment(founder_id);
+CREATE INDEX IF NOT EXISTS idx_hunter_enrichment_founder_id ON public.hunter_enrichment(founder_id);
 CREATE INDEX IF NOT EXISTS idx_web_scraping_enrichment_company_id ON public.web_scraping_enrichment(company_id);
 CREATE INDEX IF NOT EXISTS idx_dealroom_enrichment_company_id ON public.dealroom_enrichment(company_id);
 CREATE INDEX IF NOT EXISTS idx_linkedin_enrichment_founder_id ON public.linkedin_enrichment(founder_id);
@@ -667,7 +658,7 @@ CREATE INDEX IF NOT EXISTS idx_funding_rounds_stage ON public.funding_rounds(sta
 CREATE INDEX IF NOT EXISTS idx_bcv_company_id ON public.business_computed_values(company_id);
 CREATE INDEX IF NOT EXISTS idx_bcv_calculus_date ON public.business_computed_values(calculus_date);
 CREATE INDEX IF NOT EXISTS idx_bcv_in_attio ON public.business_computed_values(in_attio);
-CREATE INDEX IF NOT EXISTS idx_bcv_solution_fit_cap ON public.business_computed_values(solution_fit_cap);
+CREATE INDEX IF NOT EXISTS idx_bcv_solution_fit_cg ON public.business_computed_values(solution_fit_cg);
 CREATE INDEX IF NOT EXISTS idx_bcv_solution_fit_by ON public.business_computed_values(solution_fit_by);
 CREATE INDEX IF NOT EXISTS idx_bcv_global_fund_score ON public.business_computed_values(global_fund_score);
 
@@ -827,10 +818,11 @@ CREATE POLICY "Authenticated users have full access"
 -- Capgemini sectors and industries taxonomy
 CREATE TABLE IF NOT EXISTS public.cap_sectors_and_industries (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  scope TEXT,
   sector TEXT,
-  industry_label1 TEXT,
-  industry_label2 TEXT,
-  UNIQUE (sector, industry_label1, industry_label2)
+  industry TEXT,
+  description TEXT,
+  UNIQUE (scope, sector, industry)
 );
 
 COMMENT ON TABLE public.cap_sectors_and_industries IS
@@ -839,14 +831,17 @@ COMMENT ON TABLE public.cap_sectors_and_industries IS
 COMMENT ON COLUMN public.cap_sectors_and_industries.id IS
   'Unique identifier. Auto-generated UUID.';
 
+COMMENT ON COLUMN public.cap_sectors_and_industries.scope IS
+  'Fund scope for this sector/industry. "cg" for Capgemini only, "by" for Bouygues only.';
+
 COMMENT ON COLUMN public.cap_sectors_and_industries.sector IS
   'Top-level sector name in the Capgemini taxonomy.';
 
-COMMENT ON COLUMN public.cap_sectors_and_industries.industry_label1 IS
+COMMENT ON COLUMN public.cap_sectors_and_industries.industry IS
   'First-level industry label within the sector.';
 
-COMMENT ON COLUMN public.cap_sectors_and_industries.industry_label2 IS
-  'Second-level industry label, finer granularity within industry_label1.';
+COMMENT ON COLUMN public.cap_sectors_and_industries.description IS
+  'Description of the sector/industry.';
 
 ALTER TABLE public.cap_sectors_and_industries ENABLE ROW LEVEL SECURITY;
 
@@ -909,12 +904,16 @@ CREATE POLICY "Authenticated users have full access"
 
 -- Go-to-market target reference list
 CREATE TABLE IF NOT EXISTS public.gtm_target (
+  scope TEXT,
   name TEXT PRIMARY KEY,
   description TEXT
 );
 
 COMMENT ON TABLE public.gtm_target IS
   'Reference list of go-to-market target segments. Used as a pipeline configuration table to classify companies by their GTM target (e.g. B2B, B2C, B2B2C).';
+
+COMMENT ON COLUMN public.gtm_target.scope IS
+  'Fund scope for this GTM target. "cg" for Capgemini only, "by" for Bouygues only. "both" for both funds.';
 
 COMMENT ON COLUMN public.gtm_target.name IS
   'GTM target name, used as primary key.';
