@@ -9,6 +9,13 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
+function logMemory(label: string) {
+  const mem = Deno.memoryUsage();
+  console.log(
+    `[MEM] ${label} — heapUsed: ${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB, heapTotal: ${(mem.heapTotal / 1024 / 1024).toFixed(1)}MB, rss: ${(mem.rss / 1024 / 1024).toFixed(1)}MB`
+  );
+}
+
 function jsonResponse(body: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(body), {
     headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -17,10 +24,16 @@ function jsonResponse(body: Record<string, unknown>, status = 200) {
 }
 
 function extractDomainsFromCompaniesSheet(fileBuffer: ArrayBuffer): string[] {
+  logMemory("before Uint8Array copy");
   const raw = new Uint8Array(fileBuffer);
+  console.log(`[INFO] file size: ${(raw.byteLength / 1024 / 1024).toFixed(2)}MB`);
 
   // Pass 1: read only sheet names (no cell data parsed)
+  logMemory("before bookSheets pass");
   const stub = XLSX.read(raw, { type: "array", bookSheets: true });
+  console.log(`[INFO] sheets found: ${stub.SheetNames.join(", ")}`);
+  logMemory("after bookSheets pass");
+
   const companiesSheetName = stub.SheetNames.find((name: string) =>
     name.startsWith("Companies")
   );
@@ -30,11 +43,14 @@ function extractDomainsFromCompaniesSheet(fileBuffer: ArrayBuffer): string[] {
   }
 
   // Pass 2: parse only the target sheet in dense mode
+  logMemory("before XLSX.read (single sheet, dense)");
   const workbook = XLSX.read(raw, {
     type: "array",
     sheets: [companiesSheetName],
     dense: true,
   });
+  logMemory("after XLSX.read (single sheet, dense)");
+
   const sheet = workbook.Sheets[companiesSheetName];
 
   if (!sheet["!ref"]) {
@@ -42,6 +58,9 @@ function extractDomainsFromCompaniesSheet(fileBuffer: ArrayBuffer): string[] {
   }
 
   const range = XLSX.utils.decode_range(sheet["!ref"]);
+  console.log(
+    `[INFO] sheet "${companiesSheetName}" range: ${range.e.r + 1} rows x ${range.e.c + 1} cols`
+  );
   const HEADER_ROW = 5; // Row index 5 (6th row), matching Python's pd.read_excel(header=5)
 
   // Find the column index for "Domain Name" in the header row
@@ -61,7 +80,12 @@ function extractDomainsFromCompaniesSheet(fileBuffer: ArrayBuffer): string[] {
     throw new Error("'Domain Name' column not found in the header row");
   }
 
+  console.log(
+    `[INFO] "Domain Name" found at column index ${domainCol} (${XLSX.utils.encode_col(domainCol)})`
+  );
+
   // Walk only the "Domain Name" column, starting from the row after the header
+  logMemory("before column extraction");
   const domains = new Set<string>();
   const data = sheet["!data"];
   if (data) {
@@ -72,6 +96,8 @@ function extractDomainsFromCompaniesSheet(fileBuffer: ArrayBuffer): string[] {
       }
     }
   }
+  console.log(`[INFO] extracted ${domains.size} unique domains`);
+  logMemory("after column extraction");
 
   return [...domains];
 }
@@ -101,9 +127,11 @@ Deno.serve(async (req: Request) => {
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
+    logMemory("before storage download");
     const { data: fileData, error: downloadError } = await supabase.storage
       .from(bucketName)
       .download(file_path);
+    logMemory("after storage download");
 
     if (downloadError || !fileData) {
       throw new Error(
@@ -115,8 +143,10 @@ Deno.serve(async (req: Request) => {
     let domains: string[];
     {
       const fileBuffer = await fileData.arrayBuffer();
+      logMemory("after arrayBuffer()");
       domains = extractDomainsFromCompaniesSheet(fileBuffer);
     }
+    logMemory("after extraction (buffer out of scope)");
 
     if (!domains.length) {
       return jsonResponse({
@@ -128,10 +158,12 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    logMemory("before DB query");
     const { data: existingRecords, error: queryError } = await supabase
       .from("traxcn_companies")
       .select("domain_name")
       .in("domain_name", domains);
+    logMemory("after DB query");
 
     if (queryError) {
       throw new Error(
