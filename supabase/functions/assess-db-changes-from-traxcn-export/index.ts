@@ -1,6 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import { unzipSync } from "https://esm.sh/fflate@0.8.2";
+import { inflateSync, Inflate } from "https://esm.sh/fflate@0.8.2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -25,151 +25,154 @@ function jsonResponse(body: Record<string, unknown>, status = 200) {
 
 const decoder = new TextDecoder();
 
-/**
- * Extracts a single ZIP entry as a decoded string.
- */
-function extractZipEntry(
-  compressed: Uint8Array,
-  name: string
-): string | null {
-  let result: string | null = null;
-  const bytes = unzipSync(compressed, {
-    filter: (file) => {
-      if (file.name === name) {
-        console.log(
-          `[ZIP] extracting ${file.name} (${(file.originalSize / 1024).toFixed(0)}KB decompressed)`
-        );
-        return true;
-      }
-      return false;
-    },
-  });
-  if (bytes[name]) {
-    result = decoder.decode(bytes[name]);
+// ── ZIP parsing utilities ──────────────────────────────────────────────
+
+function readU16(b: Uint8Array, o: number): number {
+  return b[o] | (b[o + 1] << 8);
+}
+function readU32(b: Uint8Array, o: number): number {
+  return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
+}
+
+interface ZipEntry {
+  compressedSize: number;
+  uncompressedSize: number;
+  compressionMethod: number;
+  localHeaderOffset: number;
+}
+
+function parseZipDirectory(buf: Uint8Array): Map<string, ZipEntry> {
+  // Find End of Central Directory (scan backwards, max 65KB comment)
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
+    if (buf[i] === 0x50 && buf[i + 1] === 0x4b && buf[i + 2] === 0x05 && buf[i + 3] === 0x06) {
+      eocd = i;
+      break;
+    }
   }
-  return result;
-}
+  if (eocd === -1) throw new Error("ZIP EOCD not found");
 
-/**
- * Extracts a single ZIP entry as raw bytes (no string decode).
- */
-function extractZipEntryRaw(
-  compressed: Uint8Array,
-  name: string
-): Uint8Array | null {
-  const bytes = unzipSync(compressed, {
-    filter: (file) => {
-      if (file.name === name) {
-        console.log(
-          `[ZIP] extracting ${file.name} (${(file.originalSize / 1024).toFixed(0)}KB decompressed)`
-        );
-        return true;
-      }
-      return false;
-    },
-  });
-  return bytes[name] ?? null;
-}
+  const totalEntries = readU16(buf, eocd + 10);
+  const cdOffset = readU32(buf, eocd + 16);
+  const entries = new Map<string, ZipEntry>();
+  let pos = cdOffset;
 
-/**
- * Extracts two ZIP entries as decoded strings in a single pass.
- */
-function extractZipEntryPair(
-  compressed: Uint8Array,
-  name1: string,
-  name2: string
-): { first: string | null; second: string | null } {
-  const want = new Set([name1, name2]);
-  const bytes = unzipSync(compressed, {
-    filter: (file) => {
-      if (want.has(file.name)) {
-        console.log(
-          `[ZIP] extracting ${file.name} (${(file.originalSize / 1024).toFixed(0)}KB decompressed)`
-        );
-        return true;
-      }
-      return false;
-    },
-  });
-  return {
-    first: bytes[name1] ? decoder.decode(bytes[name1]) : null,
-    second: bytes[name2] ? decoder.decode(bytes[name2]) : null,
-  };
-}
-
-/**
- * Finds the ZIP path for the first sheet named "Companies*".
- */
-function findCompaniesSheetPath(
-  workbookXml: string,
-  relsXml: string
-): string {
-  let match = workbookXml.match(
-    /<sheet[^>]*?\sname="(Companies[^"]*)"[^>]*?\sr:id="([^"]+)"/s
-  );
-  if (!match) {
-    match = workbookXml.match(
-      /<sheet[^>]*?\sr:id="([^"]+)"[^>]*?\sname="(Companies[^"]*)"/s
-    );
-    if (!match) throw new Error("No sheet starting with 'Companies' found");
-    match = [match[0], match[2], match[1]] as unknown as RegExpMatchArray;
+  for (let e = 0; e < totalEntries; e++) {
+    if (readU32(buf, pos) !== 0x02014b50) throw new Error("Bad CD entry");
+    const compressionMethod = readU16(buf, pos + 10);
+    const compressedSize = readU32(buf, pos + 20);
+    const uncompressedSize = readU32(buf, pos + 24);
+    const nameLen = readU16(buf, pos + 28);
+    const extraLen = readU16(buf, pos + 30);
+    const commentLen = readU16(buf, pos + 32);
+    const localHeaderOffset = readU32(buf, pos + 42);
+    const name = decoder.decode(buf.subarray(pos + 46, pos + 46 + nameLen));
+    entries.set(name, { compressedSize, uncompressedSize, compressionMethod, localHeaderOffset });
+    pos += 46 + nameLen + extraLen + commentLen;
   }
-  const [, sheetName, rId] = match;
+  return entries;
+}
 
-  const relMatch = relsXml.match(
-    new RegExp(`Id="${rId}"[^>]*?Target="([^"]+)"`)
-  );
-  if (!relMatch) throw new Error(`Relationship ${rId} not found`);
+/** Copies the compressed payload for a ZIP entry (uses .slice() to detach from the original buffer). */
+function copyEntryCompressed(buf: Uint8Array, entry: ZipEntry): Uint8Array {
+  const off = entry.localHeaderOffset;
+  if (readU32(buf, off) !== 0x04034b50) throw new Error("Bad local header");
+  const nameLen = readU16(buf, off + 26);
+  const extraLen = readU16(buf, off + 28);
+  const dataStart = off + 30 + nameLen + extraLen;
+  return buf.slice(dataStart, dataStart + entry.compressedSize); // .slice() copies
+}
 
-  let target = relMatch[1].replace(/^\//, "");
+/** Decompresses a small entry synchronously and returns a string. */
+function inflateEntryToString(buf: Uint8Array, entry: ZipEntry): string {
+  const raw = copyEntryCompressed(buf, entry);
+  const bytes = entry.compressionMethod === 8 ? inflateSync(raw) : raw;
+  return decoder.decode(bytes);
+}
+
+// ── Metadata parsing ───────────────────────────────────────────────────
+
+function findCompaniesSheetPath(workbookXml: string, relsXml: string): string {
+  let m = workbookXml.match(/<sheet[^>]*?\sname="(Companies[^"]*)"[^>]*?\sr:id="([^"]+)"/s);
+  if (!m) {
+    m = workbookXml.match(/<sheet[^>]*?\sr:id="([^"]+)"[^>]*?\sname="(Companies[^"]*)"/s);
+    if (!m) throw new Error("No sheet starting with 'Companies' found");
+    m = [m[0], m[2], m[1]] as unknown as RegExpMatchArray;
+  }
+  const [, sheetName, rId] = m;
+  const rel = relsXml.match(new RegExp(`Id="${rId}"[^>]*?Target="([^"]+)"`));
+  if (!rel) throw new Error(`Relationship ${rId} not found`);
+  let target = rel[1].replace(/^\//, "");
   if (!target.startsWith("xl/")) target = "xl/" + target;
-
   console.log(`[INFO] Companies sheet: "${sheetName}" → ${target}`);
   return target;
 }
 
-/**
- * Parses the sheet XML into header cells and data cells grouped by column.
- * Stores only raw values (shared string indices or literal values) — resolution happens later.
- */
-function collectSheetData(sheetXml: string): {
+// ── Streaming sheet scanner ────────────────────────────────────────────
+// Uses fflate's Inflate to decompress in chunks — never holds 93MB in memory.
+// Collects: header cells + shared-string indices per column (compact).
+
+function streamScanSheet(
+  compressedData: Uint8Array,
+  compressionMethod: number,
+  headerRow: number
+): {
   headerCells: { col: string; type: string; rawValue: string }[];
-  dataCells: Map<string, { type: string; rawValue: string }[]>;
-  headerRow: number;
+  ssIndicesByCol: Map<string, number[]>;
 } {
-  const HEADER_ROW = 6;
-  const cellRegex =
-    /<c\s+r="([A-Z]+)(\d+)"(?:[^>]*?\st="([^"]*)")?[^>]*?>(.*?)<\/c>/gs;
-
   const headerCells: { col: string; type: string; rawValue: string }[] = [];
-  // Map from column → list of raw cell values in data rows
-  const dataCells = new Map<string, { type: string; rawValue: string }[]>();
+  const ssIndicesByCol = new Map<string, number[]>();
+  const td = new TextDecoder();
+  let carryOver = "";
 
-  let cellMatch;
-  while ((cellMatch = cellRegex.exec(sheetXml)) !== null) {
-    const [, col, rowStr, type, inner] = cellMatch;
-    const row = parseInt(rowStr, 10);
-    if (row < HEADER_ROW) continue;
+  function processText(text: string, isFinal: boolean) {
+    const combined = carryOver + text;
+    const re = /<c\s+r="([A-Z]+)(\d+)"(?:[^>]*?\st="([^"]*)")?[^>]*?>(.*?)<\/c>/g;
+    let lastEnd = 0;
+    let match;
 
-    const vMatch = inner.match(/<v>([^<]*)<\/v>/);
-    if (!vMatch) continue;
+    while ((match = re.exec(combined)) !== null) {
+      lastEnd = re.lastIndex;
+      const [, col, rowStr, type, inner] = match;
+      const row = parseInt(rowStr, 10);
+      if (row < headerRow) continue;
 
-    if (row === HEADER_ROW) {
-      headerCells.push({ col, type: type ?? "", rawValue: vMatch[1] });
+      const v = inner.match(/<v>([^<]*)<\/v>/);
+      if (!v) continue;
+
+      if (row === headerRow) {
+        headerCells.push({ col, type: type ?? "", rawValue: v[1] });
+      } else if ((type ?? "") === "s") {
+        // Only track shared-string cells (domains are always strings)
+        if (!ssIndicesByCol.has(col)) ssIndicesByCol.set(col, []);
+        ssIndicesByCol.get(col)!.push(parseInt(v[1], 10));
+      }
+    }
+
+    if (isFinal) {
+      carryOver = "";
     } else {
-      // Only store data — we'll filter to the right column after resolving headers
-      if (!dataCells.has(col)) dataCells.set(col, []);
-      dataCells.get(col)!.push({ type: type ?? "", rawValue: vMatch[1] });
+      const tail = combined.slice(lastEnd);
+      const lt = tail.lastIndexOf("<");
+      carryOver = lt >= 0 ? tail.slice(lt) : "";
     }
   }
 
-  return { headerCells, dataCells, headerRow: HEADER_ROW };
+  if (compressionMethod === 0) {
+    processText(td.decode(compressedData), true);
+  } else {
+    const inf = new Inflate((chunk: Uint8Array, final: boolean) => {
+      processText(td.decode(chunk, { stream: !final }), final);
+    });
+    inf.push(compressedData, true);
+  }
+
+  return { headerCells, ssIndicesByCol };
 }
 
-/**
- * Scans sharedStrings.xml raw bytes, only decoding strings at needed indices.
- * This avoids creating a ~71MB JS string — we only decode the small slices we need.
- */
+// ── SharedStrings byte-level resolver ──────────────────────────────────
+// Scans raw bytes, only decodes strings at needed indices.
+
 function resolveSharedStringsByIndex(
   rawBytes: Uint8Array,
   neededIndices: Set<number>
@@ -179,91 +182,46 @@ function resolveSharedStringsByIndex(
 
   const maxNeeded = Math.max(...neededIndices);
   let siCount = -1;
-
-  // Byte patterns for scanning
-  // <si  = [0x3C, 0x73, 0x69]  (followed by > or space)
-  // <t   = [0x3C, 0x74]        (followed by > or space)
-  // </t> = [0x3C, 0x2F, 0x74, 0x3E]
-  const LT = 0x3c; // <
-  const GT = 0x3e; // >
-  const SLASH = 0x2f; // /
-  const S_LOW = 0x73; // s
-  const I_LOW = 0x69; // i
-  const T_LOW = 0x74; // t
-
+  const LT = 0x3c, GT = 0x3e, SLASH = 0x2f, S = 0x73, I = 0x69, T = 0x74;
   let i = 0;
   const len = rawBytes.length;
 
   while (i < len) {
-    // Look for '<'
-    if (rawBytes[i] !== LT) {
-      i++;
-      continue;
-    }
+    if (rawBytes[i] !== LT) { i++; continue; }
 
-    // Check for <si> or <si  (start of shared string item)
-    if (
-      i + 3 < len &&
-      rawBytes[i + 1] === S_LOW &&
-      rawBytes[i + 2] === I_LOW &&
-      (rawBytes[i + 3] === GT || rawBytes[i + 3] === 0x20)
-    ) {
+    // Match <si> or <si ...>
+    if (i + 3 < len && rawBytes[i + 1] === S && rawBytes[i + 2] === I &&
+        (rawBytes[i + 3] === GT || rawBytes[i + 3] === 0x20)) {
       siCount++;
-      if (siCount > maxNeeded) break; // no more needed indices
+      if (siCount > maxNeeded) break;
 
       if (neededIndices.has(siCount)) {
-        // Find all <t>...</t> content within this <si>...</si> and concatenate
         let value = "";
         let j = i + 4;
         while (j < len) {
-          // Look for </si>
-          if (
-            rawBytes[j] === LT &&
-            j + 4 < len &&
-            rawBytes[j + 1] === SLASH &&
-            rawBytes[j + 2] === S_LOW &&
-            rawBytes[j + 3] === I_LOW &&
-            rawBytes[j + 4] === GT
-          ) {
-            break; // end of this <si>
-          }
-          // Look for <t> or <t ...>
-          if (
-            rawBytes[j] === LT &&
-            j + 1 < len &&
-            rawBytes[j + 1] === T_LOW &&
-            (j + 2 >= len || rawBytes[j + 2] === GT || rawBytes[j + 2] === 0x20)
-          ) {
-            // Find the closing > of this <t...>
+          if (rawBytes[j] === LT && j + 4 < len &&
+              rawBytes[j + 1] === SLASH && rawBytes[j + 2] === S &&
+              rawBytes[j + 3] === I && rawBytes[j + 4] === GT) break;
+          if (rawBytes[j] === LT && j + 1 < len && rawBytes[j + 1] === T &&
+              (j + 2 >= len || rawBytes[j + 2] === GT || rawBytes[j + 2] === 0x20)) {
             let tEnd = j + 2;
             while (tEnd < len && rawBytes[tEnd] !== GT) tEnd++;
-            tEnd++; // skip >
-            // Now find </t>
-            const contentStart = tEnd;
-            let contentEnd = tEnd;
-            while (contentEnd + 3 < len) {
-              if (
-                rawBytes[contentEnd] === LT &&
-                rawBytes[contentEnd + 1] === SLASH &&
-                rawBytes[contentEnd + 2] === T_LOW &&
-                rawBytes[contentEnd + 3] === GT
-              ) {
-                break;
-              }
-              contentEnd++;
+            tEnd++;
+            const cStart = tEnd;
+            let cEnd = tEnd;
+            while (cEnd + 3 < len) {
+              if (rawBytes[cEnd] === LT && rawBytes[cEnd + 1] === SLASH &&
+                  rawBytes[cEnd + 2] === T && rawBytes[cEnd + 3] === GT) break;
+              cEnd++;
             }
-            if (contentEnd > contentStart) {
-              value += decoder.decode(
-                rawBytes.subarray(contentStart, contentEnd)
-              );
-            }
-            j = contentEnd + 4; // skip </t>
+            if (cEnd > cStart) value += decoder.decode(rawBytes.subarray(cStart, cEnd));
+            j = cEnd + 4;
             continue;
           }
           j++;
         }
         result.set(siCount, value);
-        if (result.size === neededIndices.size) break; // found all
+        if (result.size === neededIndices.size) break;
         i = j;
         continue;
       }
@@ -273,140 +231,11 @@ function resolveSharedStringsByIndex(
     i++;
   }
 
-  console.log(
-    `[INFO] resolved ${result.size}/${neededIndices.size} shared strings (scanned ${siCount + 1} entries)`
-  );
+  console.log(`[INFO] resolved ${result.size}/${neededIndices.size} shared strings (scanned ${siCount + 1} entries)`);
   return result;
 }
 
-/**
- * Main extraction — two-round approach to avoid holding sharedStrings + sheet simultaneously.
- *
- * Round 1: metadata + sheet XML → identify domain column, collect needed shared string indices
- * Round 2: sharedStrings raw bytes only → resolve only needed indices at byte level
- */
-function extractDomainsFromCompaniesSheet(
-  compressed: Uint8Array
-): string[] {
-  console.log(
-    `[INFO] file size: ${(compressed.byteLength / 1024 / 1024).toFixed(2)}MB`
-  );
-
-  // === Round 1: metadata + sheet XML ===
-  logMemory("round 1: extracting metadata");
-  const { first: workbookXml, second: relsXml } = extractZipEntryPair(
-    compressed,
-    "xl/workbook.xml",
-    "xl/_rels/workbook.xml.rels"
-  );
-  if (!workbookXml || !relsXml) {
-    throw new Error("Missing workbook.xml or relationships file");
-  }
-  logMemory("round 1: metadata done");
-
-  const sheetPath = findCompaniesSheetPath(workbookXml, relsXml);
-
-  logMemory("round 1: extracting sheet XML");
-  let sheetXml: string | null = extractZipEntry(compressed, sheetPath);
-  if (!sheetXml) throw new Error(`Sheet file ${sheetPath} not found in ZIP`);
-  console.log(
-    `[INFO] sheet XML size: ${(sheetXml.length / 1024 / 1024).toFixed(1)}MB`
-  );
-  logMemory("round 1: sheet extracted");
-
-  // Parse the sheet: collect header cells + all data cells by column
-  const { headerCells, dataCells } = collectSheetData(sheetXml);
-  sheetXml = null; // free the sheet XML before loading sharedStrings
-  logMemory("round 1: sheet parsed and freed");
-
-  console.log(
-    `[INFO] header has ${headerCells.length} columns, data has ${dataCells.size} columns`
-  );
-
-  // Collect ALL shared string indices we'll need (headers + all data columns)
-  // We need headers to find which column is "Domain Name"
-  const neededIndices = new Set<number>();
-  for (const cell of headerCells) {
-    if (cell.type === "s") {
-      neededIndices.add(parseInt(cell.rawValue, 10));
-    }
-  }
-
-  // We don't know which column is Domain Name yet (headers might be shared strings),
-  // so we must resolve headers first. But to minimize shared string lookups,
-  // we only add data-column indices AFTER identifying the right column.
-  // Strategy: resolve header indices → find Domain Name column → then resolve data indices.
-
-  // === Round 2a: resolve header shared strings ===
-  logMemory("round 2a: extracting sharedStrings (raw bytes)");
-  let ssRawBytes: Uint8Array | null = extractZipEntryRaw(
-    compressed,
-    "xl/sharedStrings.xml"
-  );
-  if (!ssRawBytes) {
-    throw new Error("xl/sharedStrings.xml not found in ZIP");
-  }
-  console.log(
-    `[INFO] sharedStrings raw size: ${(ssRawBytes.byteLength / 1024 / 1024).toFixed(1)}MB`
-  );
-  logMemory("round 2a: sharedStrings extracted");
-
-  // Resolve only header indices first
-  const headerStrings = resolveSharedStringsByIndex(ssRawBytes, neededIndices);
-  logMemory("round 2a: headers resolved");
-
-  // Find Domain Name column
-  let domainCol: string | null = null;
-  for (const cell of headerCells) {
-    let value: string;
-    if (cell.type === "s") {
-      value = headerStrings.get(parseInt(cell.rawValue, 10)) ?? "";
-    } else {
-      value = cell.rawValue;
-    }
-    if (value.trim() === "Domain Name") {
-      domainCol = cell.col;
-      break;
-    }
-  }
-
-  if (!domainCol) {
-    throw new Error("'Domain Name' column not found in the header row");
-  }
-  console.log(`[INFO] "Domain Name" found in column ${domainCol}`);
-
-  // Get data cells for the Domain Name column only
-  const domainDataCells = dataCells.get(domainCol) ?? [];
-  console.log(`[INFO] ${domainDataCells.length} data cells in column ${domainCol}`);
-
-  // Collect shared string indices needed for data
-  const dataIndices = new Set<number>();
-  const directDomains = new Set<string>();
-  for (const cell of domainDataCells) {
-    if (cell.type === "s") {
-      dataIndices.add(parseInt(cell.rawValue, 10));
-    } else {
-      const trimmed = cell.rawValue.trim();
-      if (trimmed) directDomains.add(trimmed);
-    }
-  }
-
-  // === Round 2b: resolve data shared strings ===
-  logMemory("round 2b: resolving data shared strings");
-  const dataStrings = resolveSharedStringsByIndex(ssRawBytes, dataIndices);
-  ssRawBytes = null; // free
-  logMemory("round 2b: done, sharedStrings freed");
-
-  // Build final domain set
-  const domains = new Set<string>(directDomains);
-  for (const [, value] of dataStrings) {
-    const trimmed = value.trim();
-    if (trimmed) domains.add(trimmed);
-  }
-
-  console.log(`[INFO] extracted ${domains.size} unique domains`);
-  return [...domains];
-}
+// ── Main handler ───────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -415,21 +244,14 @@ Deno.serve(async (req: Request) => {
 
   try {
     const { file_path } = await req.json();
-
     if (!file_path) {
-      return jsonResponse(
-        { success: false, error: "file_path is required" },
-        400
-      );
+      return jsonResponse({ success: false, error: "file_path is required" }, 400);
     }
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const bucketName = Deno.env.get("TRAXCN_EXPORTS_BUCKET_NAME");
-
-    if (!bucketName) {
-      throw new Error("TRAXCN_EXPORTS_BUCKET_NAME is not set");
-    }
+    if (!bucketName) throw new Error("TRAXCN_EXPORTS_BUCKET_NAME is not set");
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
@@ -440,21 +262,105 @@ Deno.serve(async (req: Request) => {
     logMemory("after storage download");
 
     if (downloadError || !fileData) {
-      throw new Error(
-        `Failed to download file '${file_path}': ${downloadError?.message}`
-      );
+      throw new Error(`Failed to download file '${file_path}': ${downloadError?.message}`);
     }
 
-    let domains: string[];
-    {
-      const fileBuffer = await fileData.arrayBuffer();
-      logMemory("after arrayBuffer()");
-      const compressed = new Uint8Array(fileBuffer);
-      domains = extractDomainsFromCompaniesSheet(compressed);
-    }
-    logMemory("after extraction (buffer out of scope)");
+    // ── Step 1: Parse ZIP directory, extract compressed copies, free the 63MB buffer ──
+    let zipBuffer: Uint8Array | null = new Uint8Array(await fileData.arrayBuffer());
+    console.log(`[INFO] file size: ${(zipBuffer.byteLength / 1024 / 1024).toFixed(2)}MB`);
+    logMemory("after arrayBuffer");
 
-    if (!domains.length) {
+    const entries = parseZipDirectory(zipBuffer);
+    console.log(`[INFO] ZIP entries: ${[...entries.keys()].join(", ")}`);
+
+    // Decompress tiny metadata directly
+    const wbEntry = entries.get("xl/workbook.xml");
+    const relsEntry = entries.get("xl/_rels/workbook.xml.rels");
+    if (!wbEntry || !relsEntry) throw new Error("Missing workbook metadata in ZIP");
+    const sheetPath = findCompaniesSheetPath(
+      inflateEntryToString(zipBuffer, wbEntry),
+      inflateEntryToString(zipBuffer, relsEntry)
+    );
+
+    // Copy compressed payloads for the two large entries
+    const sheetEntry = entries.get(sheetPath);
+    const ssEntry = entries.get("xl/sharedStrings.xml");
+    if (!sheetEntry) throw new Error(`${sheetPath} not found in ZIP`);
+    if (!ssEntry) throw new Error("xl/sharedStrings.xml not found in ZIP");
+
+    const sheetCompressed = copyEntryCompressed(zipBuffer, sheetEntry);
+    const ssCompressed = copyEntryCompressed(zipBuffer, ssEntry);
+    console.log(
+      `[INFO] compressed copies — sheet: ${(sheetCompressed.length / 1024 / 1024).toFixed(1)}MB, ss: ${(ssCompressed.length / 1024 / 1024).toFixed(1)}MB`
+    );
+
+    // FREE THE 63MB BUFFER
+    zipBuffer = null;
+    logMemory("after freeing ZIP buffer");
+
+    // ── Step 2: Stream-scan sheet (never holds 93MB in memory) ──
+    logMemory("before sheet stream scan");
+    const { headerCells, ssIndicesByCol } = streamScanSheet(
+      sheetCompressed,
+      sheetEntry.compressionMethod,
+      6 // header row (1-indexed)
+    );
+    // sheetCompressed is no longer needed — let it be GC'd
+    console.log(
+      `[INFO] header: ${headerCells.length} cols, data columns with strings: ${ssIndicesByCol.size}`
+    );
+    logMemory("after sheet stream scan");
+
+    // ── Step 3: Inflate sharedStrings, resolve only needed indices ──
+    logMemory("before sharedStrings inflate");
+    const ssBytes: Uint8Array = ssEntry.compressionMethod === 8
+      ? inflateSync(ssCompressed)
+      : ssCompressed;
+    console.log(`[INFO] sharedStrings inflated: ${(ssBytes.byteLength / 1024 / 1024).toFixed(1)}MB`);
+    logMemory("after sharedStrings inflate");
+
+    // Resolve header indices → find Domain Name column
+    const headerNeeded = new Set<number>();
+    for (const cell of headerCells) {
+      if (cell.type === "s") headerNeeded.add(parseInt(cell.rawValue, 10));
+    }
+    const headerStrings = resolveSharedStringsByIndex(ssBytes, headerNeeded);
+
+    let domainCol: string | null = null;
+    for (const cell of headerCells) {
+      const value = cell.type === "s"
+        ? (headerStrings.get(parseInt(cell.rawValue, 10)) ?? "")
+        : cell.rawValue;
+      if (value.trim() === "Domain Name") {
+        domainCol = cell.col;
+        break;
+      }
+    }
+    if (!domainCol) throw new Error("'Domain Name' column not found in header row");
+    console.log(`[INFO] "Domain Name" → column ${domainCol}`);
+
+    // Resolve data indices for that column
+    const domainIndices = ssIndicesByCol.get(domainCol) ?? [];
+    console.log(`[INFO] ${domainIndices.length} data cells in column ${domainCol}`);
+
+    const dataNeeded = new Set(domainIndices);
+    const dataStrings = resolveSharedStringsByIndex(ssBytes, dataNeeded);
+    logMemory("after resolving domain strings");
+
+    // Build unique domains
+    const domains = new Set<string>();
+    for (const idx of domainIndices) {
+      const v = dataStrings.get(idx);
+      if (v) {
+        const trimmed = v.trim();
+        if (trimmed) domains.add(trimmed);
+      }
+    }
+    const domainList = [...domains];
+    console.log(`[INFO] extracted ${domainList.length} unique domains`);
+    logMemory("after domain extraction");
+
+    if (!domainList.length) {
       return jsonResponse({
         success: true,
         number_of_companies_to_add: 0,
@@ -464,23 +370,22 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // ── Step 4: DB query ──
     logMemory("before DB query");
     const { data: existingRecords, error: queryError } = await supabase
       .from("traxcn_companies")
       .select("domain_name")
-      .in("domain_name", domains);
+      .in("domain_name", domainList);
     logMemory("after DB query");
 
     if (queryError) {
-      throw new Error(
-        `Failed to query existing domains: ${queryError.message}`
-      );
+      throw new Error(`Failed to query existing domains: ${queryError.message}`);
     }
 
     const existingDomains = new Set(
       existingRecords.map((r: { domain_name: string }) => r.domain_name)
     );
-    const newDomains = domains.filter((d) => !existingDomains.has(d));
+    const newDomains = domainList.filter((d) => !existingDomains.has(d));
 
     return jsonResponse({
       success: true,
