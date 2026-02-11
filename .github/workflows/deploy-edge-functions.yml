@@ -31,3 +31,6 @@ jobs:
 
       - name: Deploy assess-db-changes-from-traxcn-export function
         run: supabase functions deploy assess-db-changes-from-traxcn-export --no-verify-jwt --project-ref $PROJECT_ID
+
+      - name: Deploy run-prefect-pipeline function
+        run: supabase functions deploy run-prefect-pipeline --no-verify-jwt --project-ref $PROJECT_ID
