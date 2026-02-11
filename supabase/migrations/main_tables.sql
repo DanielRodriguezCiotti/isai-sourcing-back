@@ -245,17 +245,19 @@ CREATE TABLE IF NOT EXISTS public.web_scraping_enrichment (
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now(),
 
-  company_id UUID NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
+  domain TEXT NOT NULL REFERENCES public.companies(domain) ON DELETE CASCADE,
   storage_path TEXT, -- Path in Supabase Storage containing the raw scraped website data
   sourcing_date DATE, -- Date when the website was scraped
   description TEXT,
   detailed_solution TEXT,
+  tech_description TEXT,
   key_features TEXT,
   use_cases TEXT,
   industries_served_description TEXT,
   key_clients TEXT[],
   key_partners TEXT[],
-  nb_of_clients_identified TEXT
+  nb_of_clients_identified INTEGER,
+  success BOOLEAN
 );
 
 -- web_scraping_enrichment column descriptions
@@ -271,8 +273,8 @@ COMMENT ON COLUMN public.web_scraping_enrichment.created_at IS
 COMMENT ON COLUMN public.web_scraping_enrichment.updated_at IS
   'Timestamp of the last modification to the enrichment record. Automatically updated via trigger.';
 
-COMMENT ON COLUMN public.web_scraping_enrichment.company_id IS
-  'Foreign key referencing the company this enrichment belongs to. Cascades on delete.';
+COMMENT ON COLUMN public.web_scraping_enrichment.domain IS
+  'Domain of the company this enrichment belongs to. Cascades on delete.';
 
 COMMENT ON COLUMN public.web_scraping_enrichment.storage_path IS
   'Path in Supabase Storage pointing to the raw scraped website data. Used to reprocess or audit enrichment data.';
@@ -303,6 +305,9 @@ COMMENT ON COLUMN public.web_scraping_enrichment.key_partners IS
 
 COMMENT ON COLUMN public.web_scraping_enrichment.nb_of_clients_identified IS
   'Number of clients identified or claimed on the website (stored as text to accommodate ranges or qualifiers like "100+").';
+
+COMMENT ON COLUMN public.web_scraping_enrichment.success IS
+  'Whether the web scraping was successful or not.';
 
 -- Create the hunter_enrichment table
 CREATE TABLE IF NOT EXISTS public.hunter_enrichment (
@@ -635,7 +640,7 @@ CREATE INDEX IF NOT EXISTS idx_companies_created_at ON public.companies(created_
 CREATE INDEX IF NOT EXISTS idx_founders_company_id ON public.founders(company_id);
 CREATE INDEX IF NOT EXISTS idx_founders_name ON public.founders(name);
 CREATE INDEX IF NOT EXISTS idx_hunter_enrichment_founder_id ON public.hunter_enrichment(founder_id);
-CREATE INDEX IF NOT EXISTS idx_web_scraping_enrichment_company_id ON public.web_scraping_enrichment(company_id);
+CREATE INDEX IF NOT EXISTS idx_web_scraping_enrichment_domain ON public.web_scraping_enrichment(domain);
 CREATE INDEX IF NOT EXISTS idx_dealroom_enrichment_company_id ON public.dealroom_enrichment(company_id);
 CREATE INDEX IF NOT EXISTS idx_funding_rounds_company_id ON public.funding_rounds(company_id);
 CREATE INDEX IF NOT EXISTS idx_funding_rounds_date ON public.funding_rounds(date);

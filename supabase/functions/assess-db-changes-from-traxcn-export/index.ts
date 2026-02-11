@@ -17,29 +17,63 @@ function jsonResponse(body: Record<string, unknown>, status = 200) {
 }
 
 function extractDomainsFromCompaniesSheet(fileBuffer: ArrayBuffer): string[] {
-  const workbook = XLSX.read(new Uint8Array(fileBuffer), { type: "array" });
+  const raw = new Uint8Array(fileBuffer);
 
-  const companiesSheet = workbook.SheetNames.find((name: string) =>
+  // Pass 1: read only sheet names (no cell data parsed)
+  const stub = XLSX.read(raw, { type: "array", bookSheets: true });
+  const companiesSheetName = stub.SheetNames.find((name: string) =>
     name.startsWith("Companies")
   );
 
-  if (!companiesSheet) {
+  if (!companiesSheetName) {
     throw new Error("No sheet starting with 'Companies' found in the file");
   }
 
-  const sheet = workbook.Sheets[companiesSheet];
-  // Row index 5 (6th row) is the header, matching Python's pd.read_excel(header=5)
-  const rows: Record<string, string>[] = XLSX.utils.sheet_to_json(sheet, {
-    range: 5,
+  // Pass 2: parse only the target sheet in dense mode
+  const workbook = XLSX.read(raw, {
+    type: "array",
+    sheets: [companiesSheetName],
+    dense: true,
   });
+  const sheet = workbook.Sheets[companiesSheetName];
 
-  const domains = rows
-    .map((row) => row["Domain Name"])
-    .filter((domain): domain is string =>
-      typeof domain === "string" && domain.trim() !== ""
-    );
+  if (!sheet["!ref"]) {
+    throw new Error("Companies sheet is empty");
+  }
 
-  return [...new Set(domains)];
+  const range = XLSX.utils.decode_range(sheet["!ref"]);
+  const HEADER_ROW = 5; // Row index 5 (6th row), matching Python's pd.read_excel(header=5)
+
+  // Find the column index for "Domain Name" in the header row
+  let domainCol = -1;
+  const headerRowData = sheet["!data"]?.[HEADER_ROW];
+  if (headerRowData) {
+    for (let C = range.s.c; C <= range.e.c; ++C) {
+      const cell = headerRowData[C];
+      if (cell && String(cell.v).trim() === "Domain Name") {
+        domainCol = C;
+        break;
+      }
+    }
+  }
+
+  if (domainCol === -1) {
+    throw new Error("'Domain Name' column not found in the header row");
+  }
+
+  // Walk only the "Domain Name" column, starting from the row after the header
+  const domains = new Set<string>();
+  const data = sheet["!data"];
+  if (data) {
+    for (let R = HEADER_ROW + 1; R <= range.e.r; ++R) {
+      const cell = data[R]?.[domainCol];
+      if (cell && typeof cell.v === "string" && cell.v.trim() !== "") {
+        domains.add(cell.v.trim());
+      }
+    }
+  }
+
+  return [...domains];
 }
 
 Deno.serve(async (req: Request) => {
@@ -77,8 +111,12 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const fileBuffer = await fileData.arrayBuffer();
-    const domains = extractDomainsFromCompaniesSheet(fileBuffer);
+    // Block-scope the buffer so it becomes unreachable before the DB query
+    let domains: string[];
+    {
+      const fileBuffer = await fileData.arrayBuffer();
+      domains = extractDomainsFromCompaniesSheet(fileBuffer);
+    }
 
     if (!domains.length) {
       return jsonResponse({
