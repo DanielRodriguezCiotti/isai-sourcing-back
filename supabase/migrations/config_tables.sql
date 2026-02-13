@@ -192,6 +192,33 @@ CREATE POLICY "Authenticated users have full access"
   WITH CHECK (true);
 
 -- Business models reference list
+CREATE TABLE IF NOT EXISTS public.business_mapping (
+  name TEXT PRIMARY KEY,
+  description TEXT,
+  scope TEXT
+);
+
+COMMENT ON TABLE public.business_mapping IS
+  'Reference list of business mapping types. Used as a pipeline configuration table to classify companies by their business mapping.';
+
+COMMENT ON COLUMN public.business_mapping.name IS
+  'Business mapping name, used as primary key.';
+
+COMMENT ON COLUMN public.business_mapping.description IS
+  'Description of the business mapping.';
+
+COMMENT ON COLUMN public.business_mapping.scope IS
+  'Scope of the business mapping. "cg" for Capgemini only, "by" for Bouygues only. "both" for both funds.';
+
+ALTER TABLE public.business_mapping ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Authenticated users have full access"
+  ON public.business_mapping FOR ALL
+  TO authenticated
+  USING (true)
+  WITH CHECK (true);
+
+-- Business models reference list
 CREATE TABLE IF NOT EXISTS public.business_models (
   name TEXT PRIMARY KEY,
   description TEXT
