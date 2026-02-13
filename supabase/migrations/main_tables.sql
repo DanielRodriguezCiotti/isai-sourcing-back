@@ -90,8 +90,6 @@ COMMENT ON COLUMN public.companies.last_funding_date IS
 COMMENT ON COLUMN public.companies.all_investors IS
   'List of all institutional investors in the company, max 50 words (enforced at application level). Source: Tracxn only (Companies Covered 1.1 → Institutional Investors). Not available in Crunchbase.';
 
-COMMENT ON COLUMN public.companies.headcount IS
-  'Current total number of employees. Sources: CB (organizations.csv → employee_count), Tracxn (Companies Covered 1.1 → Total Employee Count). Priority: Tracxn.';
 
 -- Create the funding_rounds table
 CREATE TABLE IF NOT EXISTS public.funding_rounds (
@@ -196,7 +194,7 @@ CREATE TABLE IF NOT EXISTS public.dealroom_enrichment (
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now(),
 
-  company_id UUID NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
+  domain TEXT NOT NULL REFERENCES public.companies(domain) ON DELETE CASCADE,
   storage_path TEXT, -- Path in Supabase Storage containing the raw scraped Dealroom profile
   sourcing_date DATE, -- Date when the Dealroom data was retrieved
   headcount INTEGER,
@@ -218,7 +216,7 @@ COMMENT ON COLUMN public.dealroom_enrichment.created_at IS
 COMMENT ON COLUMN public.dealroom_enrichment.updated_at IS
   'Timestamp of the last modification to the enrichment record. Automatically updated via trigger.';
 
-COMMENT ON COLUMN public.dealroom_enrichment.company_id IS
+COMMENT ON COLUMN public.dealroom_enrichment.domain IS
   'Foreign key referencing the company this enrichment belongs to. Cascades on delete.';
 
 COMMENT ON COLUMN public.dealroom_enrichment.storage_path IS
@@ -255,7 +253,8 @@ CREATE TABLE IF NOT EXISTS public.web_scraping_enrichment (
   industries_served_description TEXT,
   key_clients TEXT[],
   key_partners TEXT[],
-  nb_of_clients_identified TEXT
+  nb_of_clients_identified BIGINT,
+  success BOOLEAN
 );
 
 -- web_scraping_enrichment column descriptions
@@ -310,10 +309,10 @@ CREATE TABLE IF NOT EXISTS public.hunter_enrichment (
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now(),
 
-  founder_id UUID NOT NULL REFERENCES public.founders(id) ON DELETE CASCADE,
+  domain TEXT NOT NULL REFERENCES public.companies(domain) ON DELETE CASCADE,
   storage_path TEXT, -- Path in Supabase Storage containing the raw Hunter data
   sourcing_date DATE, -- Date when the Hunter data was retrieved
-  email TEXT
+  emails TEXT[]
 );
 
 -- hunter_enrichment column descriptions
@@ -329,8 +328,8 @@ COMMENT ON COLUMN public.hunter_enrichment.created_at IS
 COMMENT ON COLUMN public.hunter_enrichment.updated_at IS
   'Timestamp of the last modification to the enrichment record. Automatically updated via trigger.';
 
-COMMENT ON COLUMN public.hunter_enrichment.founder_id IS
-  'Foreign key referencing the founder this enrichment belongs to. Cascades on delete.';
+COMMENT ON COLUMN public.hunter_enrichment.domain IS
+  'Domain of the company this enrichment belongs to. Cascades on delete.';
 
 COMMENT ON COLUMN public.hunter_enrichment.storage_path IS
   'Path in Supabase Storage pointing to the raw Hunter response. Used to reprocess or audit enrichment data.';
@@ -338,7 +337,7 @@ COMMENT ON COLUMN public.hunter_enrichment.storage_path IS
 COMMENT ON COLUMN public.hunter_enrichment.sourcing_date IS
   'Date when the Hunter data was retrieved. Useful to track data freshness.';
 
-COMMENT ON COLUMN public.hunter_enrichment.email IS
+COMMENT ON COLUMN public.hunter_enrichment.emails IS
   'Professional email address of the founder, retrieved from Hunter.';
 
 -- Create the business_computed_values table
@@ -347,41 +346,49 @@ CREATE TABLE IF NOT EXISTS public.business_computed_values (
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now(),
 
-  company_id UUID NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
-  calculus_date TIMESTAMPTZ NOT NULL DEFAULT now(), -- When the full calculation pipeline was last run
+  domain TEXT NOT NULL UNIQUE REFERENCES public.companies(domain) ON DELETE CASCADE,
 
+  -------FUZZY MATCHING-------
   -- Client/partner matching against reference lists
   global_2000_clients TEXT[], -- Global 2000 companies identified as clients of this company using fuzzy matching
   competitors_cg TEXT[], -- Capgemini competitors that are partners or clients of this company using fuzzy matching
   competitors_by TEXT[], -- Bouygues competitors that are partners or clients of this company using fuzzy matching
+  platforms_cg TEXT[], -- Capgemini platforms that are partners or clients of this company using fuzzy matching
+  platforms_by TEXT[], -- Bouygues platforms that are partners or clients of this company using fuzzy matching
 
-  -- Go-to-market targets (per fund)
-  gtm_target TEXT, -- GTM target classification for Capgemini fund using generic GTM taxonomy
-  gtm_target_by TEXT, -- GTM target classification for Bouygues fund using specific BY GTM taxonomy
-
+  -------DB CALCULATED VALUES-------
   -- Funding round computed fields (derived from funding_rounds table)
   first_vc_round_date DATE, -- Earliest institutional VC round date cross CB and Tracxn
   first_vc_round_amount NUMERIC, -- Amount of the first institutional VC round, in millions USD cross CB and Tracxn
+  last_vc_round_date DATE, -- Latest institutional VC round date cross CB and Tracxn
+  last_vc_round_amount NUMERIC, -- Amount of the latest institutional VC round, in millions USD cross CB and Tracxn
+  all_investors TEXT[], -- All investors of the company cross CB and Tracxn
   last_round_lead_investors TEXT, -- Lead investor(s) of the most recent round cross CB and Tracxn
   total_number_of_funding_rounds INTEGER, -- Total number of funding rounds, max of (sum of CB vs sum of Tracxn)
 
+  -------LLM BASED CLASSIFICATIONS-------
+  -- Go-to-market targets (per fund)
+  gtm_target TEXT, -- GTM target classification for Capgemini fund using generic GTM taxonomy
+  gtm_target_by TEXT, -- GTM target classification for Bouygues fund using specific BY GTM taxonomy
   -- Business classification
   business_model TEXT, -- Business model classification for the company using business model taxonomy
+  business_mapping TEXT, -- Business mapping classification for the company using business mapping taxonomy
+  all_industries_served_sorted TEXT[], -- All industries the company serves sorted by relevance
+  -- Technology classification
+  tech_play TEXT, -- Primary technology play
+  tech_tags TEXT[], -- Static technology tags from taxonomy
+  tech_tags_dynamic TEXT[], -- Dynamically computed technology tags
 
+  -------SECTOR/INDUSTRY CALCULUS FROM ALL INDUSTRIES -------
   -- Sector/industry classification (per fund) - we identify the industries served from the taxonomy in order of relevance
   scope TEXT, -- "cg" for Capgemini, "by" for Bouygues, "both" for both, it depends only on the sectors and industry served
   primary_sector_served_cg TEXT, -- Primary sector for Capgemini taxonomy
   primary_industry_served_cg TEXT, -- Primary industry for Capgemini taxonomy
   primary_sector_served_by TEXT, -- Primary sector for Bouygues taxonomy
   primary_industry_served_by TEXT, -- Primary industry for Bouygues taxonomy
-  all_industries_served TEXT[], -- All industries the company serves
-
-  -- Technology classification
-  tech_play TEXT, -- Primary technology play
-  tech_tags TEXT[], -- Static technology tags from taxonomy
-  tech_tags_dynamic TEXT[], -- Dynamically computed technology tags
   all_tech_tags TEXT[], -- Union of static + dynamic tech tags
 
+  -------SCORES-------
   -- Fit scores (per fund where applicable)
   solution_fit_cg INTEGER, -- Solution fit score for Capgemini
   solution_fit_by INTEGER, -- Solution fit score for Bouygues
@@ -395,10 +402,14 @@ CREATE TABLE IF NOT EXISTS public.business_computed_values (
   -- Attio CRM sync
   in_attio BOOLEAN, -- Whether this company exists in Attio
   attio_stage TEXT, -- Current pipeline stage in Attio
-  attio_status TEXT -- Current status in Attio
+  attio_status TEXT, -- Current status in Attio
+
+  -- founders information
+  founders_background TEXT,
+  serial_entrepreneur BOOLEAN
 );
 
--- Column descriptions
+-- business_computed_values column descriptions
 COMMENT ON TABLE public.business_computed_values IS
   'ISAI business-specific computed values for each company. Contains scores, classifications, and tags generated by the calculation pipeline. Each row represents the latest computed state for a company.';
 
@@ -411,72 +422,92 @@ COMMENT ON COLUMN public.business_computed_values.created_at IS
 COMMENT ON COLUMN public.business_computed_values.updated_at IS
   'Timestamp of the last modification to the record. Automatically updated via trigger.';
 
-COMMENT ON COLUMN public.business_computed_values.company_id IS
-  'Foreign key referencing the company these computed values belong to. Cascades on delete.';
+COMMENT ON COLUMN public.business_computed_values.domain IS
+  'Domain of the company these computed values belong to. Foreign key referencing companies(domain). Cascades on delete.';
 
-COMMENT ON COLUMN public.business_computed_values.calculus_date IS
-  'Timestamp of when the full calculation pipeline was last run for this company. Critical for tracking data freshness and pipeline execution history.';
-
+-- Fuzzy matching columns
 COMMENT ON COLUMN public.business_computed_values.global_2000_clients IS
-  'List of Forbes Global 2000 companies identified as clients of this company. Matched against the global_2000 reference table.';
+  'List of Forbes Global 2000 companies identified as clients of this company. Matched using fuzzy matching against the global_2000 reference table.';
 
 COMMENT ON COLUMN public.business_computed_values.competitors_cg IS
-  'List of Capgemini competitors that are partners or clients of this company. Matched against the cap_competitors reference table.';
+  'List of Capgemini competitors that are partners or clients of this company. Matched using fuzzy matching against the cap_competitors reference table.';
 
 COMMENT ON COLUMN public.business_computed_values.competitors_by IS
-  'List of Bouygues competitors that are partners or clients of this company. Matched against the by_competitors reference table.';
+  'List of Bouygues competitors that are partners or clients of this company. Matched using fuzzy matching against the by_competitors reference table.';
 
-COMMENT ON COLUMN public.business_computed_values.gtm_target IS
-  'Go-to-market target classification for the Capgemini fund perspective. Matched against the gtm_target reference table.';
+COMMENT ON COLUMN public.business_computed_values.platforms_cg IS
+  'List of Capgemini platforms that are partners or clients of this company. Matched using fuzzy matching against the cap_sw_partners reference table.';
 
-COMMENT ON COLUMN public.business_computed_values.gtm_target_by IS
-  'Go-to-market target classification for the Bouygues fund perspective. Matched against the gtm_target reference table.';
+COMMENT ON COLUMN public.business_computed_values.platforms_by IS
+  'List of Bouygues platforms that are partners or clients of this company. Matched using fuzzy matching against the by_platforms reference table.';
 
+-- DB calculated values (derived from funding_rounds table)
 COMMENT ON COLUMN public.business_computed_values.first_vc_round_date IS
-  'Date of the first institutional VC round, computed from the funding_rounds table (earliest round excluding angel).';
+  'Date of the first institutional VC round, computed from the funding_rounds table (earliest round excluding angel). Cross-referenced between CB and Tracxn.';
 
 COMMENT ON COLUMN public.business_computed_values.first_vc_round_amount IS
-  'Amount raised in the first institutional VC round in millions USD, computed from the funding_rounds table.';
+  'Amount raised in the first institutional VC round in millions USD, computed from the funding_rounds table. Cross-referenced between CB and Tracxn.';
+
+COMMENT ON COLUMN public.business_computed_values.last_vc_round_date IS
+  'Date of the latest institutional VC round, computed from the funding_rounds table. Cross-referenced between CB and Tracxn.';
+
+COMMENT ON COLUMN public.business_computed_values.last_vc_round_amount IS
+  'Amount raised in the latest institutional VC round in millions USD, computed from the funding_rounds table. Cross-referenced between CB and Tracxn.';
+
+COMMENT ON COLUMN public.business_computed_values.all_investors IS
+  'All investors of the company, aggregated from the funding_rounds table. Cross-referenced between CB and Tracxn.';
 
 COMMENT ON COLUMN public.business_computed_values.last_round_lead_investors IS
-  'Lead investor(s) of the most recent funding round, computed from the funding_rounds table.';
+  'Lead investor(s) of the most recent funding round, computed from the funding_rounds table. Cross-referenced between CB and Tracxn.';
 
 COMMENT ON COLUMN public.business_computed_values.total_number_of_funding_rounds IS
   'Total number of funding rounds, computed as the max of the sum from CB vs the sum from Tracxn.';
 
-COMMENT ON COLUMN public.business_computed_values.business_model IS
-  'Business model classification for the company. Matched against the business_models reference table.';
+-- LLM-based classifications
+COMMENT ON COLUMN public.business_computed_values.gtm_target IS
+  'Go-to-market target classification for the Capgemini fund perspective. Classified by LLM using the gtm_target reference taxonomy.';
 
+COMMENT ON COLUMN public.business_computed_values.gtm_target_by IS
+  'Go-to-market target classification for the Bouygues fund perspective. Classified by LLM using the gtm_target reference taxonomy.';
+
+COMMENT ON COLUMN public.business_computed_values.business_model IS
+  'Business model classification for the company. Classified by LLM using the business_models reference taxonomy.';
+
+COMMENT ON COLUMN public.business_computed_values.business_mapping IS
+  'Business mapping classification for the company. Classified by LLM using the business mapping taxonomy.';
+
+COMMENT ON COLUMN public.business_computed_values.all_industries_served_sorted IS
+  'Complete list of all industries the company serves, across both fund taxonomies, sorted by relevance. Classified by LLM.';
+
+COMMENT ON COLUMN public.business_computed_values.tech_play IS
+  'Primary technology play classification. Classified by LLM using the cap_tech_play reference taxonomy.';
+
+COMMENT ON COLUMN public.business_computed_values.tech_tags IS
+  'Static technology tags assigned from the technology taxonomy. Classified by LLM.';
+
+COMMENT ON COLUMN public.business_computed_values.tech_tags_dynamic IS
+  'Dynamically computed technology tags, generated by the pipeline based on company data analysis. Classified by LLM.';
+
+-- Sector/industry calculus (derived from all_industries_served_sorted)
 COMMENT ON COLUMN public.business_computed_values.scope IS
   'Fund scope for this company. "cg" for Capgemini only, "by" for Bouygues only, "both" for both funds. Determined solely by the sectors and industries served.';
 
 COMMENT ON COLUMN public.business_computed_values.primary_sector_served_cg IS
-  'Primary sector the company serves, classified using the Capgemini taxonomy (cap_sectors_and_industries).';
+  'Primary sector the company serves, classified using the Capgemini taxonomy (industries).';
 
 COMMENT ON COLUMN public.business_computed_values.primary_industry_served_cg IS
-  'Primary industry the company serves, classified using the Capgemini taxonomy (cap_sectors_and_industries).';
+  'Primary industry the company serves, classified using the Capgemini taxonomy (industries).';
 
 COMMENT ON COLUMN public.business_computed_values.primary_sector_served_by IS
-  'Primary sector the company serves, classified for the Bouygues fund perspective.';
+  'Primary sector the company serves, classified using the Bouygues taxonomy.';
 
 COMMENT ON COLUMN public.business_computed_values.primary_industry_served_by IS
-  'Primary industry the company serves, classified for the Bouygues fund perspective.';
-
-COMMENT ON COLUMN public.business_computed_values.all_industries_served IS
-  'Complete list of all industries the company serves, across both fund taxonomies.';
-
-COMMENT ON COLUMN public.business_computed_values.tech_play IS
-  'Primary technology play classification. Matched against the cap_tech_play reference table.';
-
-COMMENT ON COLUMN public.business_computed_values.tech_tags IS
-  'Static technology tags assigned from the technology taxonomy.';
-
-COMMENT ON COLUMN public.business_computed_values.tech_tags_dynamic IS
-  'Dynamically computed technology tags, generated by the pipeline based on company data analysis.';
+  'Primary industry the company serves, classified using the Bouygues taxonomy.';
 
 COMMENT ON COLUMN public.business_computed_values.all_tech_tags IS
   'Union of static (tech_tags) and dynamic (tech_tags_dynamic) technology tags.';
 
+-- Scores
 COMMENT ON COLUMN public.business_computed_values.solution_fit_cg IS
   'Solution fit score for the Capgemini fund. Integer score evaluating how well the company solution fits Capgemini needs.';
 
@@ -501,6 +532,7 @@ COMMENT ON COLUMN public.business_computed_values.traction_score IS
 COMMENT ON COLUMN public.business_computed_values.global_fund_score IS
   'Global fund fit score. Overall integer score combining all fit dimensions for fund-level decision making.';
 
+-- Attio CRM sync
 COMMENT ON COLUMN public.business_computed_values.in_attio IS
   'Whether this company currently exists in the Attio CRM. Used for pipeline synchronization.';
 
@@ -509,6 +541,13 @@ COMMENT ON COLUMN public.business_computed_values.attio_stage IS
 
 COMMENT ON COLUMN public.business_computed_values.attio_status IS
   'Current status of the company in the Attio CRM.';
+
+-- Founders information
+COMMENT ON COLUMN public.business_computed_values.founders_background IS
+  'Summary of the founders professional background, computed from the founders table data.';
+
+COMMENT ON COLUMN public.business_computed_values.serial_entrepreneur IS
+  'Whether any founder of the company is a serial entrepreneur (has founded multiple companies).';
 
 
 -- Create trigger function for updated_at
@@ -634,15 +673,18 @@ CREATE INDEX IF NOT EXISTS idx_companies_inc_date ON public.companies(inc_date);
 CREATE INDEX IF NOT EXISTS idx_companies_created_at ON public.companies(created_at);
 CREATE INDEX IF NOT EXISTS idx_founders_company_id ON public.founders(company_id);
 CREATE INDEX IF NOT EXISTS idx_founders_name ON public.founders(name);
+<<<<<<< HEAD
 CREATE INDEX IF NOT EXISTS idx_hunter_enrichment_founder_id ON public.hunter_enrichment(founder_id);
 CREATE INDEX IF NOT EXISTS idx_web_scraping_enrichment_company_id ON public.web_scraping_enrichment(company_id);
 CREATE INDEX IF NOT EXISTS idx_dealroom_enrichment_company_id ON public.dealroom_enrichment(company_id);
+=======
+CREATE INDEX IF NOT EXISTS idx_hunter_enrichment_domain ON public.hunter_enrichment(domain);
+CREATE INDEX IF NOT EXISTS idx_web_scraping_enrichment_domain ON public.web_scraping_enrichment(domain);
+CREATE INDEX IF NOT EXISTS idx_dealroom_enrichment_domain ON public.dealroom_enrichment(domain);
+>>>>>>> 0100e59 (update tables with last remote version)
 CREATE INDEX IF NOT EXISTS idx_funding_rounds_company_id ON public.funding_rounds(company_id);
 CREATE INDEX IF NOT EXISTS idx_funding_rounds_date ON public.funding_rounds(date);
 CREATE INDEX IF NOT EXISTS idx_funding_rounds_stage ON public.funding_rounds(stage);
-CREATE INDEX IF NOT EXISTS idx_bcv_company_id ON public.business_computed_values(company_id);
-CREATE INDEX IF NOT EXISTS idx_bcv_calculus_date ON public.business_computed_values(calculus_date);
-CREATE INDEX IF NOT EXISTS idx_bcv_in_attio ON public.business_computed_values(in_attio);
+CREATE INDEX IF NOT EXISTS idx_bcv_domain ON public.business_computed_values(domain);
 CREATE INDEX IF NOT EXISTS idx_bcv_solution_fit_cg ON public.business_computed_values(solution_fit_cg);
 CREATE INDEX IF NOT EXISTS idx_bcv_solution_fit_by ON public.business_computed_values(solution_fit_by);
-CREATE INDEX IF NOT EXISTS idx_bcv_global_fund_score ON public.business_computed_values(global_fund_score);
