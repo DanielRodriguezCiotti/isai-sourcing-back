@@ -362,6 +362,7 @@ CREATE TABLE IF NOT EXISTS public.business_computed_values (
 
   -------DB CALCULATED VALUES-------
   -- Funding round computed fields (derived from funding_rounds table)
+  vc_current_stage TEXT, -- Current VC stage of the company cross CB and Tracxn
   first_vc_round_date DATE, -- Earliest institutional VC round date cross CB and Tracxn
   first_vc_round_amount NUMERIC, -- Amount of the first institutional VC round, in millions USD cross CB and Tracxn
   last_vc_round_date DATE, -- Latest institutional VC round date cross CB and Tracxn
