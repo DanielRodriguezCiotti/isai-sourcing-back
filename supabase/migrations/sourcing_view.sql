@@ -1,4 +1,6 @@
-CREATE OR REPLACE VIEW public.company_overview AS
+CREATE OR REPLACE VIEW public.sourcing_view
+  WITH (security_invoker = true)
+AS
 SELECT
   -- Fund scope
   bcv.scope AS fund_prime_scope,
@@ -30,7 +32,7 @@ SELECT
   bcv.gtm_target_by,
 
   -- Funding
-  bvc.vc_current_stage,
+  bcv.vc_current_stage,
   bcv.first_vc_round_date,
   bcv.first_vc_round_amount,
   c.total_amount_raised,
@@ -52,17 +54,17 @@ SELECT
   bcv.primary_industry_served_by,
   bcv.all_industries_served_sorted AS all_industries_served,
   bcv.business_mapping,
-  bcv.all_tech_tags AS tech_tags_auto,
+  bcv.all_tech_tags AS tech_tags,
 
   -- Scores
   bcv.solution_fit_cg,
   bcv.solution_fit_by,
   bcv.business_fit_cg,
   bcv.business_fit_by,
-  bcv.maturity_fit AS maturity_fit_score,
+  bcv.maturity_fit,
   bcv.equity_score,
   bcv.traction_score,
-  bcv.global_fund_score AS global_fund_fit_score,
+  bcv.global_fund_score,
 
   -- Attio
   bcv.in_attio AS present_in_attio,
@@ -78,3 +80,7 @@ LEFT JOIN LATERAL (
   ORDER BY w.sourcing_date DESC NULLS LAST
   LIMIT 1
 ) wse ON true;
+
+-- Grant access to authenticated users (matches policy pattern on underlying tables)
+GRANT SELECT ON public.sourcing_view TO authenticated;
+REVOKE ALL ON public.sourcing_view FROM anon;
